@@ -2,9 +2,8 @@ import os
 import numpy as np
 from tqdm import tqdm
 import torch
-from loader import WEMDataset, EOS_TOKEN, PAD_TOKEN
 from torch.utils.data import DataLoader
-from train_WEM.model import OLT2D, OLT2DConfig, CrossBatchDistributed
+from train.model import OLT2D, OLT2DConfig, CrossBatchDistributed
 from torch.distributed.device_mesh import init_device_mesh
 from datetime import timedelta
 import argparse
@@ -20,10 +19,24 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import math
 import sentencepiece as spm
 
-MASK_TOKEN = 2
+EOS_TOKEN     = 3
+MASK_TOKEN    = 2
+PAD_TOKEN     = 1
 dtype = torch.bfloat16
 
 torch.backends.cudnn.benchmark = True 
+
+class StructuredGridDataset(torch.utils.data.Dataset):
+    def __init__(self, length=256, width=256, vocab_size=64):
+        self.length = length
+        self.width = width
+        self.vocab_size = vocab_size
+
+    def __len__(self):
+        return 10_000_000  # arbitrarily large
+
+    def __getitem__(self, idx):
+        return torch.randint(high=self.vocab_size, size=(self.length, self.width))
 
 def run(args):
     world_size = int(os.environ["WORLD_SIZE"])
@@ -62,17 +75,14 @@ def run(args):
 
     base_dir = args.base_dir
 
-    
-    train_dataset = WEMDataset(directory=f"{base_dir}/x_chrom/feather/train", ctx_len=args.sequence_length, tokenizer=tokenizer)
-    test_dataset = WEMDataset(directory=f"{base_dir}/x_chrom/feather/val", ctx_len=args.sequence_length, tokenizer=tokenizer)
-
     ################################################################
 
     logging = True # whether to log the training loss on wandb
     batch_size = args.batch_size // dp_size # batch size per process
     ctx_len = args.sequence_length * args.num_genes # context length of the model
     print(f"Real Batch Size: {batch_size}")
-
+    train_dataset = StructuredGridDataset(length=args.num_genes, width=args.sequence_length, vocab_size=vocab_size)
+    test_dataset = StructuredGridDataset(length=args.num_genes, width=args.sequence_length, vocab_size=vocab_size)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=2, prefetch_factor=2).__iter__()
     test_loader = DataLoader(test_dataset, batch_size=args.mini_batch_size, shuffle=False, num_workers=2, prefetch_factor=2).__iter__()
 
