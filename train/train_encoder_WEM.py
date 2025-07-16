@@ -26,13 +26,6 @@ dtype = torch.bfloat16
 torch.backends.cudnn.benchmark = True 
 
 def run(args):
-    # data config
-    # start_memory_trace()
-    ########### INITIALIZE DISTRIBUTED TRAINING #################
-    # initialize the process group
-    # dist.init_process_group("nccl")
-    # gloo_group = dist.new_group(backend="gloo", timeout=timedelta(hours=1))
-    # nccl_group = dist.new_group(backend="nccl", timeout=timedelta(hours=1))
     world_size = int(os.environ["WORLD_SIZE"])
     tp_size = args.tp_size
     dp_size = world_size//tp_size
