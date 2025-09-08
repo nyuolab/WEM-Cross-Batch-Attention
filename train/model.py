@@ -7,10 +7,12 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
-from flash_attn import flash_attn_qkvpacked_func
+# from flash_attn import flash_attn_qkvpacked_func
 from memory import MemTracker
 from metrics import compute_tensor_stats
 from torch.distributed.nn.functional import all_to_all
+# from flash_attn.bert_padding import unpad_input, pad_input
+# from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
 
 class CrossBatchDistributed:
 
@@ -41,6 +43,12 @@ class CrossBatchDistributed:
             x_list = None
         dist.scatter(tensor=output, scatter_list=x_list, group_src=0, group=self.group)
         return output
+    
+    def slice_attn_mask(self, attn_mask, cut_dim) -> torch.Tensor | None:
+        if attn_mask is None:
+            return None
+        attn_mask_chunk = torch.chunk(attn_mask, self.tp_size, dim=cut_dim)[self.tp_rank]
+        return attn_mask_chunk
 
 
 class SwiGLU(nn.Module):
@@ -131,14 +139,57 @@ class SelfAttention(nn.Module):
 
     def forward(self, x, attn_mask=None, freqs_cis=None):
         # x can be any shape as long as the last dimension is n_embd
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        qkv = self.c_attn(x)
-        y = flash_attn_qkvpacked_func(qkv.view(B, T, 3, self.n_embd).view(B, T, 3, self.n_head, C // self.n_head), softmax_scale=8 / self.n_embd, causal=self.autoregressive, dropout_p=self.dropout if self.training else 0)
-        y = y.contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        B, T, C = x.size()
+        H = self.n_head
+        Dh = C // H
+        if attn_mask is None:
+            attn_mask = torch.ones(B, T)
+        keep = attn_mask if attn_mask.dtype == torch.bool else (attn_mask != 0)
+        drop_p = self.dropout if self.training else 0.0
 
-        # output projection
+        # Q,K,V as (B, T, H, Dh)
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q = q.view(B, T, H, Dh)
+        k = k.view(B, T, H, Dh)
+        v = v.view(B, T, H, Dh)
+
+        if getattr(self.config, "position_encoding", "rope") == "rope":
+            q, k = apply_rotary_emb(q, k, freqs_cis)
+
+        if (~keep).any():  # at least one PAD → exact, fast varlen FlashAttn
+            # unpad before attention
+            q_bhtd = q.transpose(1, 2).contiguous()
+            k_bhtd = k.transpose(1, 2).contiguous()
+            v_bhtd = v.transpose(1, 2).contiguous()
+
+            y_bhtd = F.scaled_dot_product_attention(
+                q_bhtd, k_bhtd, v_bhtd,
+                scale=8.0 / self.n_embd,                # µP scale as you wanted
+                attn_mask=keep,                    # all-True here, but ok
+                dropout_p=drop_p,
+                is_causal=self.autoregressive,
+            )                                           # (B, H, T, Dh)
+
+            y = y_bhtd.transpose(1, 2).contiguous().view(B, T, C)
+            
+        else:
+            # no PAD → your requested SDPA call
+            # SDPA expects (B, H, T, Dh)
+            q_bhtd = q.transpose(1, 2).contiguous()
+            k_bhtd = k.transpose(1, 2).contiguous()
+            v_bhtd = v.transpose(1, 2).contiguous()
+
+            y_bhtd = F.scaled_dot_product_attention(
+                q_bhtd, k_bhtd, v_bhtd,
+                scale=8.0 / self.n_embd,                # µP scale as you wanted
+                attn_mask=None,                    # all-True here, but ok
+                dropout_p=drop_p,
+                is_causal=self.autoregressive,
+            )                                           # (B, H, T, Dh)
+
+            y = y_bhtd.transpose(1, 2).contiguous().view(B, T, C)
+
         y = self.resid_dropout(self.c_proj(y))
-
         return y
 
 class MLP(nn.Module):
@@ -235,13 +286,13 @@ class WidthBlock2D(nn.Module):
 
         # Expand the mask to match the (B*L, W) batch if provided
         if attn_mask is not None:
-            attn_mask_expanded = attn_mask.repeat_interleave(L, dim=0)
+            attn_mask_reshaped = attn_mask.contiguous().view(B * L, W)
         else:
-            attn_mask_expanded = None
+            attn_mask_reshaped = None
 
         out = self.inner(
             x_reshaped,
-            attn_mask=attn_mask_expanded,
+            attn_mask=attn_mask_reshaped,
             compute_stats=compute_stats,
             freqs_cis=self.freqs_cis_width
         )
@@ -282,13 +333,13 @@ class LengthBlock2D(nn.Module):
         x_transposed = x.transpose(1, 2).contiguous().view(B * W, L, C)
 
         if attn_mask is not None:
-            attn_mask_expanded = attn_mask.repeat_interleave(W, dim=0)
+            attn_mask_reshaped = attn_mask.transpose(1, 2).contiguous().view(B * W, L)
         else:
-            attn_mask_expanded = None
+            attn_mask_reshaped = None
 
         out = self.inner(
             x_transposed,
-            attn_mask=attn_mask_expanded,
+            attn_mask=attn_mask_reshaped,
             compute_stats=compute_stats,
             freqs_cis=self.freqs_cis_length
         )
@@ -307,8 +358,6 @@ class Block1DConfig:
     context_length: int = 2048
     param_std: float = 0.02
 
-
-
 @dataclass
 class OLT2DConfig:
     length: int = 2048  
@@ -320,12 +369,19 @@ class OLT2DConfig:
     dropout: float = 0.05
     bias: bool = False
     autoregressive: bool = False
-    position_encoding: str = "rope"
+    sequence_position_encoding: str = "rope"
+    gene_position_encoding: str = "rope"
     type: str = "alternate"  
     freq: int = 1  
     last_n: int = 4  
     track_memory: bool = False       
-    ckpt_embed:   bool = False
+    ckpt_embed:   bool = True
+    cpu_embed:   bool = False
+    checkpoint_freq: int = 1
+    checkpoint: bool = True
+    padding_index: int = 1
+
+
 
 class OLT2D(nn.Module):
     def __init__(self, config, distributed_comms: CrossBatchDistributed):
@@ -339,10 +395,11 @@ class OLT2D(nn.Module):
         self.config.param_std = 1 / np.sqrt(config.n_embd)
         self.layer_types = None
 
-        assert config.position_encoding in ["rope", "learned"]
+        assert config.sequence_position_encoding in ["rope", "learned"]
+        assert config.gene_position_encoding in ["rope", "learned"]
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd, padding_idx=config.padding_index),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList(),  # Will be populated by layer_composition_init
             ln_f = LayerNorm(config.n_embd),
@@ -422,6 +479,7 @@ class OLT2D(nn.Module):
         
         # Print layer composition for verification
         self.layer_types = []
+        print(f"Length of layers: {len(self.transformer.h)}")
         for layer in self.transformer.h:
             if isinstance(layer, WidthBlock2D):
                 self.layer_types.append("W")
@@ -457,6 +515,9 @@ class OLT2D(nn.Module):
                 # saves ~ (B·L·W·D) activations; recomputed during backward
                 tok_emb = checkpoint(lambda i: self.transformer.wte(i), idx,
                                     use_reentrant=False)
+            elif self.config.cpu_embed: 
+                with torch.autograd.graph.save_on_cpu():
+                    tok_emb = self.transformer.wte(idx)
             else:
                 tok_emb = self.transformer.wte(idx)
         if compute_stats:
@@ -468,20 +529,28 @@ class OLT2D(nn.Module):
             tok_emb = tok_emb + self.pos_emb_length[:, :l, :, :] + self.pos_emb_width[:, :, :w, :]
 
         x = self.transformer.drop(tok_emb)
-        
-        for idx, block in enumerate(self.transformer.h):
-            if idx != 0 and self.layer_types[idx-1] != self.layer_types[idx]:
-                if self.layer_types[idx] == 'W':
+        attn_mask_block = self.distributed_comms.slice_attn_mask(attn_mask, 1)
+        for li, block in enumerate(self.transformer.h):
+            if li != 0 and self.layer_types[li-1] != self.layer_types[li]:
+                if self.layer_types[li] == 'W':
                     x = self.distributed_comms.transpose_shard_2d_ddp(x, 2, 1)
+                    attn_mask_block = self.distributed_comms.slice_attn_mask(attn_mask, 2)
                 else:
                     x = self.distributed_comms.transpose_shard_2d_ddp(x, 1, 2)
-
-            x = checkpoint(
-                lambda x_, m_=block, attn_mask_=attn_mask:            # m_ is frozen
-                    m_(x_, attn_mask=attn_mask_, compute_stats=compute_stats),
-                x,
-                use_reentrant=False
-            )
+                    attn_mask_block = self.distributed_comms.slice_attn_mask(attn_mask, 1)
+            if self.config.checkpoint_freq > 0 and li%self.config.checkpoint_freq == self.config.checkpoint_freq-1:
+                if self.config.checkpoint:
+                    x = checkpoint(
+                        lambda x_, m_=block, attn_mask_=attn_mask_block:            # m_ is frozen
+                            m_(x_, attn_mask=attn_mask_, compute_stats=compute_stats),
+                        x,
+                        use_reentrant=False
+                    )
+                else:
+                    with torch.autograd.graph.save_on_cpu():
+                        x = block(x, attn_mask=attn_mask_block, compute_stats=compute_stats)
+            else:
+                x = block(x, attn_mask=attn_mask_block, compute_stats=compute_stats)
         if self.layer_types[-1] == 'L':
             x = self.distributed_comms.transpose_shard_2d_ddp(x, 2, 1)
 

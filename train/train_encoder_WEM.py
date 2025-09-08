@@ -16,6 +16,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from dataloaders import DocPackedJsonlDataset, docpack_collate
 import math
 import sentencepiece as spm
 
@@ -25,6 +26,36 @@ PAD_TOKEN     = 1
 dtype = torch.bfloat16
 
 torch.backends.cudnn.benchmark = True 
+
+
+def get_dolma_packer(args, batch_size, path):
+    ds = DocPackedJsonlDataset(
+        directory=path,
+        sp_model_path=args.tokenizer,
+        ctx_len=args.sequence_length,
+        buf_lines=8192,
+        append_bos=False,
+        append_eos=True,
+        shuffle_files=True,
+        repeat_forever=True,
+        max_chunks=args.num_genes,
+        pack_documents=args.pack_documents
+    )
+
+    def make_docpack_collate(maxP=None):
+        def collate(batch):
+            return docpack_collate(batch, maxP)
+        return collate
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,   # number of documents per batch
+        num_workers=4,
+        prefetch_factor=4,
+        persistent_workers=True,
+        pin_memory=True,
+        collate_fn=make_docpack_collate(maxP=args.num_genes),     # << important
+    )
 
 class StructuredGridDataset(torch.utils.data.Dataset):
     def __init__(self, length=256, width=256, vocab_size=64):
@@ -64,16 +95,14 @@ def run(args):
     assert args.batch_size % (dp_size * args.mini_batch_size) == 0, "Batch size must be divisible by the number of processes * mini batch size"
 
     ########### INITIALIZE DATALOADERS #################
-    DNA_tokenizer = spm.SentencePieceProcessor()
-    DNA_tokenizer.Load(args.tokenizer)
-
-    tokenizer = DNA_tokenizer
-    vocab_size = DNA_tokenizer.get_piece_size()
+    if args.dataloader == "random":
+        vocab_size = 4096
+    else:
+        tokenizer_offset = spm.SentencePieceProcessor(model_file=args.tokenizer).get_piece_size()
+        vocab_size = tokenizer_offset
 
     if rank == 0:
         print(f"Using {args.tokenizer_suffix} tokenizer")
-
-    base_dir = args.base_dir
 
     ################################################################
 
@@ -81,10 +110,19 @@ def run(args):
     batch_size = args.batch_size // dp_size # batch size per process
     ctx_len = args.sequence_length * args.num_genes # context length of the model
     print(f"Real Batch Size: {batch_size}")
-    train_dataset = StructuredGridDataset(length=args.num_genes, width=args.sequence_length, vocab_size=vocab_size)
-    test_dataset = StructuredGridDataset(length=args.num_genes, width=args.sequence_length, vocab_size=vocab_size)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=2, prefetch_factor=2).__iter__()
-    test_loader = DataLoader(test_dataset, batch_size=args.mini_batch_size, shuffle=False, num_workers=2, prefetch_factor=2).__iter__()
+
+    assert args.dataloader in ['dolma', 'UKBB', "random"], "Dataloader is not supported"
+
+    if args.dataloader == "dolma":
+        train_loader = get_dolma_packer(args, batch_size = batch_size, path=f"{args.base_dir}/train").__iter__()
+        test_loader = get_dolma_packer(args, batch_size = args.mini_batch_size, path=f"{args.base_dir}//test").__iter__()
+    elif args.dataloader == "UKBB":
+        raise "Not Implemented"
+    elif "random":
+        train_dataset = StructuredGridDataset(length=args.num_genes, width=args.sequence_length, vocab_size=vocab_size)
+        test_dataset = StructuredGridDataset(length=args.num_genes, width=args.sequence_length, vocab_size=vocab_size)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=2, prefetch_factor=2).__iter__()
+        test_loader = DataLoader(test_dataset, batch_size=args.mini_batch_size, shuffle=False, num_workers=2, prefetch_factor=2).__iter__()
 
     # set up the model
     config = OLT2DConfig()
@@ -96,10 +134,15 @@ def run(args):
     config.n_head = args.n_head
     config.dropout = args.dropout
     config.position_encoding = args.position_encoding
+    config.ckpt_embed = args.ckpt_embed
+    config.cpu_embed = args.cpu_embed
+    config.checkpoint_freq = args.checkpoint_freq
+    config.checkpoint = args.checkpoint
 
     with open(f"{args.save_name}_config.json", "w") as f:
         json.dump(config.__dict__, f)
 
+    print(config.n_layer)
     m = OLT2D(config, distributed_comms)
     m = m.to(dtype).to(device)
 
@@ -112,7 +155,7 @@ def run(args):
             resume_from = int(lines[1])
             wandb_id = lines[2].strip()
         
-        m = torch.load(f"{args.save_name}_{resume_from}.pt", map_location=device)
+        m = torch.load(f"{args.save_name}_{resume_from}.pt", map_location=device, weights_only=False)
         m.to(dtype).to(device)
         torch.cuda.empty_cache()
         print(f"Loaded model from {resume_from} token checkpoint")
@@ -200,7 +243,7 @@ def run(args):
 
         print(f"Found checkpoint at {resume_from} tokens, resuming training...")
 
-        optimizer_state_dict = torch.load(f"{args.save_name}_optimizer_{resume_from}.pt", map_location=device).state_dict()
+        optimizer_state_dict = torch.load(f"{args.save_name}_optimizer_{resume_from}.pt", map_location=device, weights_only=False).state_dict()
         optimizer.load_state_dict(optimizer_state_dict)
         del optimizer_state_dict
         
@@ -218,6 +261,7 @@ def run(args):
             wandb_id = wandb.util.generate_id()
         
         wandb.init(project=args.wandb_project_name,
+                   tags=[args.dataloader],
                    id=wandb_id,
                    resume="allow")
         
@@ -241,20 +285,18 @@ def run(args):
             wandb.log({"timing/batch_fetch_time": batch_end - batch_start}, step=trained_tokens)
 
         cum_loss = 0 # cumulative loss for this iteration
+        total_learned_tokens = 0
         optimizer.zero_grad(set_to_none=True)
 
         mask_prob = 0.15 # probability of masking a token
 
         # mask tokens
+        input_ids = distributed_comms.scatter_tensor(input_ids, dim = 1)
         mask = np.random.binomial(1, mask_prob, input_ids.shape)
         mask = torch.as_tensor(mask, dtype=torch.bool, device=device)
         mask = mask & (input_ids != PAD_TOKEN) & (input_ids != EOS_TOKEN)
         
         masked_ids = input_ids.masked_fill(mask, MASK_TOKEN)
-        masked_ids = distributed_comms.scatter_tensor(masked_ids, dim = 1)
-        input_ids = distributed_comms.scatter_tensor(input_ids, dim = 1)
-
-        mask = distributed_comms.scatter_tensor(mask, dim = 1)
 
         forward_times = []
         backward_times = []
@@ -268,16 +310,22 @@ def run(args):
             embeddings = model.forward(mini_batch_x, return_embeddings=True).flatten(start_dim=0, end_dim=1) # (B, L, W, C) -> (B*L, W, C)
             lm_head = model.module.lm_head.weight
             forward_times.append(time.time() - forward_start)
-            loss = linear_cross_entropy(embeddings, lm_head, mini_batch_y.flatten(start_dim=0, end_dim=1), reduction="none", impl="torch_compile") / (batch_size // mini_batch_size)
+            loss = linear_cross_entropy(embeddings, lm_head, mini_batch_y.flatten(start_dim=0, end_dim=1), reduction="none", impl="torch_compile") / mini_batch_size
             loss *= mask[j*mini_batch_size:(j+1)*mini_batch_size].flatten(start_dim=0, end_dim=1).float()
-            loss = loss.sum() / mask[j*mini_batch_size:(j+1)*mini_batch_size].view(-1).sum()
+
+            den = mask[j*mini_batch_size:(j+1)*mini_batch_size].view(-1).sum()
+            loss_sum = loss.sum()
+            if den > 0:
+                loss = loss_sum / den
+            else:
+                loss = loss_sum
 
             backward_start = time.time()
             loss.backward()
-            
             backward_times.append(time.time() - backward_start)
 
-            cum_loss += loss.item()
+            cum_loss += loss_sum.item()
+            total_learned_tokens += den.item()
 
         optimizer_start = time.time()
 
@@ -305,22 +353,25 @@ def run(args):
 
         all_cum_loss = [None for _ in range(world_size)]
         dist.all_gather_object(all_cum_loss, cum_loss)
-        cum_loss = np.mean(all_cum_loss) # this technically isn't exactly the same as the loss (due to different padding lengths), but it's close enough
+        all_total_tokens_loss = [None for _ in range(world_size)]
+        dist.all_gather_object(all_total_tokens_loss, total_learned_tokens)
+
+        global_average_loss = np.sum(all_cum_loss)/np.sum(all_total_tokens_loss) # Removed mean since some of the batches will have more tokens than other due to padding
 
         if rank == 0:
             if trained_tokens < 1e6:
-                pbar.set_description(f"Loss: {cum_loss:.4f}, LR: {lrs[0]:.4f} | {lrs[1]}, Trained Tokens: {trained_tokens/1e3:.3f}K")
+                pbar.set_description(f"Loss: {global_average_loss:.4f}, LR: {lrs[0]:.4f} | {lrs[1]}, Trained Tokens: {trained_tokens/1e3:.3f}K")
             elif trained_tokens < 1e9:
-                pbar.set_description(f"Loss: {cum_loss:.4f}, LR: {lrs[0]:.4f} | {lrs[1]}, Trained Tokens: {trained_tokens/1e6:.3f}M")
+                pbar.set_description(f"Loss: {global_average_loss:.4f}, LR: {lrs[0]:.4f} | {lrs[1]}, Trained Tokens: {trained_tokens/1e6:.3f}M")
             else:
-                pbar.set_description(f"Loss: {cum_loss:.4f}, LR: {lrs[0]:.4f} | {lrs[1]}, Trained Tokens: {trained_tokens/1e9:.3f}B")
+                pbar.set_description(f"Loss: {global_average_loss:.4f}, LR: {lrs[0]:.4f} | {lrs[1]}, Trained Tokens: {trained_tokens/1e9:.3f}B")
 
             if logging:
-                wandb.log({"loss": cum_loss, "lr": lrs[0], "batch_size": batch_size * dp_size}, step=trained_tokens)
+                wandb.log({"loss": global_average_loss, "lr": lrs[0], "batch_size": batch_size * dp_size}, step=trained_tokens)
 
         # count total number of tokens in the batch
         
-        num_tokens = (input_ids != PAD_TOKEN).sum().item()
+        num_tokens = torch.numel(input_ids)#(input_ids != PAD_TOKEN).sum().item()
 
         all_num_tokens = [None for _ in range(world_size)]
         # the first argument is the collected lists, the second argument is the data unique in each process
@@ -346,13 +397,12 @@ def run(args):
         trained_tokens += sum(all_num_tokens)
 
         if trained_tokens - last_test > args.test_freq:
-            # test the model
             model.eval()
 
             with torch.no_grad():
                 total_loss = 0
-                num_samples = 1024 // world_size + 1 # sample ~1M tokens
-                for _ in range(num_samples): # do 100 mini batches to get an estimate of the validation loss
+                num_samples = 1024 // world_size + 1 
+                for _ in range(num_samples): 
                     test_batch = next(test_loader).to(device)
                     test_batch = distributed_comms.scatter_tensor(test_batch, dim=1)
 
@@ -361,11 +411,14 @@ def run(args):
                     mask = mask & (test_batch != PAD_TOKEN) & (test_batch != EOS_TOKEN)
                     masked_ids = test_batch.masked_fill(mask, MASK_TOKEN)
                     
-
                     logits = model.forward(masked_ids)
                     loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), test_batch.view(-1), reduction="none")
                     loss *= mask.view(-1).float()
-                    loss = loss.sum() / mask.view(-1).sum() / world_size
+                    den = mask.view(-1).sum()
+                    if den > 0:
+                        loss = loss.sum() / den
+                    else:
+                        loss = loss.sum() 
 
                     total_loss += loss.item()
 
@@ -437,16 +490,21 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project_name", type=str, default="omnibiota", help="The name of the wandb project to log to")
     parser.add_argument("--base_dir", type=str, default="", help="The base directory for the training and validation data")
     parser.add_argument("--force_lr", action="store_true", default=False, help="Whether to override muP's learning rate scaling")
+    parser.add_argument("--checkpoint", type=bool, default=True, help="Use checkpointing in the transformer blocks, checkpoint_freq must also be > 0")
     parser.add_argument("--checkpoint_freq", type=int, default=0, help="The frequency at which activations are checkpointed")
+    parser.add_argument("--ckpt_embed", type=bool, default=True, help="Checkpoint the embedding layer")
+    parser.add_argument("--cpu_embed", type=bool, default=True, help="Use CPU offloading in embedding layer")
+    parser.add_argument("--tp_size", type=int, default=4, help="Number of GPUs in the sequence parallel")
     parser.add_argument("--warmup_period", type=float, default=0.01, help="The proportion of the total iterations to warm up")
     parser.add_argument("--FSDP", action="store_true", default=False, help="Whether to use FullyShardedDataParallel")
     parser.add_argument("--use_padding", action="store_true", default=False, help="Whether to pad the sequence with PAD_TOKEN instead of truncating a line if it doesn't fit in")
     parser.add_argument("--position_encoding", type=str, default="rope", help="The type of position encoding to use")
     parser.add_argument("--tokenizer", type=str, help="The path to the DNA tokenizer")
     parser.add_argument("--tokenizer_suffix", type=str, required=True, help="The suffix of the tokenizer to use")
+    parser.add_argument("--dataloader", type=str, default='DOLMA', help="The suffix of the tokenizer to use")
+    parser.add_argument("--pack_documents", action="store_true", default=False, help="Whether to pack multiple documents into a single sample")
     parser.add_argument("--compile", action="store_true", default=False, help="Whether to compile the model")
-    parser.add_argument("--gpu_type", type=str, default='h100', help="GPU type, only H100 and A100 are supported")
-    parser.add_argument("--tp_size", type=int, default=4, help="Number of GPUs in the sequence parallel")
+
     args = parser.parse_args()
 
     run(args)
