@@ -142,7 +142,6 @@ def run(args):
     with open(f"{args.save_name}_config.json", "w") as f:
         json.dump(config.__dict__, f)
 
-    print(config.n_layer)
     m = OLT2D(config, distributed_comms)
     m = m.to(dtype).to(device)
 
@@ -422,7 +421,7 @@ def run(args):
 
                     total_loss += loss.item()
 
-                loss = total_loss / num_samples
+                loss = total_loss / num_samples / dp_size
 
                 all_losses = [None for _ in range(world_size)]
                 dist.all_gather_object(all_losses, loss)
